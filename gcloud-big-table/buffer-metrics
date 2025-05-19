@@ -1,0 +1,215 @@
+**Option  1: Buffer Drain Rate (Option 1 - Probably Not Recommended, but can be further tuned)**
+This query calculates the average buffer drain rate, but it should be used with caution due to the caveats mentioned in the document. It's provided for completeness, but the document clearly shows this approach is not a good predictor of rebuffering.
+
+```sql
+WITH
+  TimeBucketedData AS (
+    SELECT
+      cmcd_key_sid,
+      request_datetime,
+      TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(request_datetime) / 30) * 30 AS INT64)) AS time_bucket,
+      cmcd_key_bl,
+      cmcd_key_ts
+    FROM
+      `your_project.your_dataset.your_table`
+    WHERE
+        cmcd_mode = 'request'
+      AND
+        cmcd_key_pr = 1.0
+  ),
+  LaggedData AS (
+    SELECT
+      cmcd_key_sid,
+      time_bucket,
+      cmcd_key_bl,
+      cmcd_key_ts,
+      LAG(cmcd_key_bl, 1, NULL) OVER (PARTITION BY cmcd_key_sid, time_bucket ORDER BY cmcd_key_ts) AS prev_cmcd_key_bl,
+      LAG(cmcd_key_ts, 1, NULL) OVER (PARTITION BY cmcd_key_sid, time_bucket ORDER BY cmcd_key_ts) AS prev_cmcd_key_ts
+    FROM
+      TimeBucketedData
+  ),
+  BufferDrainRates AS (
+    SELECT
+      cmcd_key_sid,
+      time_bucket,
+      AVG(
+          CASE
+              WHEN prev_cmcd_key_bl IS NOT NULL AND prev_cmcd_key_ts IS NOT NULL
+              THEN (cmcd_key_bl - prev_cmcd_key_bl) / ((cmcd_key_ts - prev_cmcd_key_ts) / 1000)
+              ELSE NULL
+          END
+      ) AS buffer_drain_rate
+    FROM
+      LaggedData
+    GROUP BY
+      cmcd_key_sid,
+      time_bucket
+  )
+SELECT
+  cmcd_key_sid,
+  time_bucket,
+  buffer_drain_rate
+FROM
+  BufferDrainRates
+ORDER BY
+  cmcd_key_sid,
+  time_bucket;
+
+
+Option 2: Buffer Health Score
+This query calculates the number of times the buffer length decreased within each session and 30-second window.
+SQL
+
+
+
+```sql
+WITH
+  TimeBucketedData AS (
+    SELECT
+      cmcd_key_sid,
+      TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(request_datetime) / 30) * 30 AS INT64)) AS time_bucket,
+      cmcd_key_mtp,
+      cmcd_key_br
+    FROM
+      `your_project.your_dataset.your_table`
+    WHERE
+        cmcd_mode = 'request'
+      AND
+        cmcd_key_pr = 1.0 -- Filter for standard playback rate
+  ),
+  BufferHealthCalculations AS (
+    SELECT
+      cmcd_key_sid,
+      time_bucket,
+      AVG(1 - (
+        IFNULL(SAFE_CAST(cmcd_key_mtp AS FLOAT64), 0) / IFNULL(SAFE_CAST(cmcd_key_br AS FLOAT64), 1)
+      )) AS buffer_health_score
+    FROM
+      TimeBucketedData
+      where cmcd_key_br > 0 -- Avoid division by 0
+    GROUP BY
+      cmcd_key_sid,
+      time_bucket
+  )
+SELECT
+  cmcd_key_sid,
+  time_bucket,
+  buffer_health_score
+FROM
+  BufferHealthCalculations
+ORDER BY
+  cmcd_key_sid,
+  time_bucket
+
+
+Buffer Length Decrease Count (Option 3)
+This query calculates the number of times the buffer length decreased within each session and 30-second window:
+
+```sql
+WITH
+  TimeBucketedData AS (
+    SELECT
+      cmcd_key_sid,
+      request_datetime,
+      TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(request_datetime) / 30) * 30 AS INT64)) AS time_bucket,
+      cmcd_key_bl,
+    FROM
+      `your_project.your_dataset.your_table`
+    WHERE
+        cmcd_mode = 'request'
+      AND
+        cmcd_key_pr = 1.0
+  ),
+  LaggedBufferLengths AS (
+    SELECT
+      cmcd_key_sid,
+      request_datetime,
+      time_bucket,
+      cmcd_key_bl,
+      LAG(cmcd_key_bl, 1, NULL) OVER (PARTITION BY cmcd_key_sid, time_bucket ORDER BY request_datetime) AS prev_cmcd_key_bl
+    FROM
+      TimeBucketedData
+  ),
+  BufferDecreaseCounts AS (
+    SELECT
+      cmcd_key_sid,
+      time_bucket,
+      COUNTIF(prev_cmcd_key_bl IS NOT NULL AND cmcd_key_bl < prev_cmcd_key_bl) AS buffer_decrease_count
+    FROM
+      LaggedBufferLengths
+    GROUP BY
+      cmcd_key_sid,
+      time_bucket
+  )
+SELECT
+  cmcd_key_sid,
+  time_bucket,
+  buffer_decrease_count
+FROM
+  BufferDecreaseCounts
+ORDER BY
+  cmcd_key_sid,
+  time_bucket
+
+Query 3: Max Buffer Length Decrease (Option 3 Refinement)
+This query calculates the maximum percentage decrease in buffer length observed within each session and 30-second window.
+
+```sql
+WITH
+  TimeBucketedData AS (
+    SELECT
+      cmcd_key_sid,
+      request_datetime,
+      TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(request_datetime) / 30) * 30 AS INT64)) AS time_bucket,
+      cmcd_key_bl
+    FROM
+      `your_project.your_dataset.your_table`
+    WHERE
+        cmcd_mode = 'request'
+        AND
+        cmcd_key_pr = 1.0
+  ),
+  LaggedBufferLengths AS (
+    SELECT
+      cmcd_key_sid,
+      request_datetime,
+      time_bucket,
+      cmcd_key_bl,
+      LAG(cmcd_key_bl, 1, NULL) OVER (PARTITION BY cmcd_key_sid, time_bucket ORDER BY request_datetime) AS prev_cmcd_key_bl
+    FROM
+      TimeBucketedData
+  ),
+  BufferLengthDecreasePercentages AS (
+    SELECT
+      cmcd_key_sid,
+      request_datetime,
+      time_bucket,
+      CASE
+        WHEN prev_cmcd_key_bl IS NOT NULL AND prev_cmcd_key_bl > 0 AND cmcd_key_bl < prev_cmcd_key_bl
+        THEN (prev_cmcd_key_bl - cmcd_key_bl) / prev_cmcd_key_bl
+        ELSE 0
+      END as buffer_length_decrease_percentage
+    FROM
+      LaggedBufferLengths
+  ),
+MaxBufferLengthDecrease AS (
+  SELECT
+    cmcd_key_sid,
+    time_bucket,
+    MAX(buffer_length_decrease_percentage) as max_buffer_length_decrease_percentage
+  FROM
+    BufferLengthDecreasePercentages
+  GROUP BY
+    cmcd_key_sid,
+    time_bucket
+)
+SELECT
+  cmcd_key_sid,
+  time_bucket,
+  max_buffer_length_decrease_percentage
+FROM
+  MaxBufferLengthDecrease
+ORDER BY
+  cmcd_key_sid,
+  time_bucket
+
